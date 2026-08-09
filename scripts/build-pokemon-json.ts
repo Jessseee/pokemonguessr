@@ -7,6 +7,8 @@ const pokemonApi = new Pokedex({ timeout: 60_000 });
 
 const WORKERS = 3;
 const BATCH_SIZE = 50;
+const MAX_FETCH_ATTEMPTS = 5;
+const RETRY_DELAY_MS = 1_000;
 const RAW_SPRITES_PREFIX = 'https://raw.githubusercontent.com/PokeAPI/sprites/master/';
 
 const GAME_NAME_OVERRIDES: Record<string, string> = {
@@ -23,23 +25,21 @@ const REGIONAL_PREFIXES = {
 	paldea: 'Paldean'
 } as const;
 
-const FORM_RULES = {
-	alwaysIncludedSuffixes: ['-gmax'],
-	cosmeticSuffixes: ['-cap', '-cosplay', '-totem'],
-	cosmeticSpecies: new Set([
-		'alcremie',
-		'furfrou',
-		'vivillon',
-		'unown',
-		'minior',
-		'flabebe',
-		'floette',
-		'florges',
-		'squawkabilly',
-		'pikachu',
-		'eevee'
-	])
-};
+const COSMETIC_SPECIES = new Set([
+	'alcremie',
+	'eevee',
+	'flabebe',
+	'floette',
+	'florges',
+	'furfrou',
+	'minior',
+	'pikachu',
+	'squawkabilly',
+	'unown',
+	'vivillon'
+]);
+
+const COSMETIC_SUFFIXES = ['-cap', '-cosplay', '-totem'];
 
 type Region = keyof typeof REGIONAL_PREFIXES;
 
@@ -64,6 +64,35 @@ function toBatches<T>(items: readonly T[], batchSize: number): T[][] {
 	return batches;
 }
 
+function isRetryableRequestError(error: unknown): boolean {
+	if (!error || typeof error !== 'object') return false;
+
+	const requestError = error as { code?: string; response?: { status?: number } };
+	const status = requestError.response?.status;
+
+	return (
+		status === 429 ||
+		(status !== undefined && status >= 500) ||
+		['ECONNABORTED', 'ECONNRESET', 'ETIMEDOUT', 'ERR_NETWORK'].includes(requestError.code ?? '')
+	);
+}
+
+async function withRetries<T>(label: string, fn: () => Promise<T>): Promise<T> {
+	for (let attempt = 1; ; attempt += 1) {
+		try {
+			return await fn();
+		} catch (error) {
+			if (attempt >= MAX_FETCH_ATTEMPTS || !isRetryableRequestError(error)) throw error;
+
+			const delay = RETRY_DELAY_MS * 2 ** (attempt - 1);
+			console.warn(
+				`\n${label} failed; retrying in ${delay / 1_000}s (${attempt}/${MAX_FETCH_ATTEMPTS})`
+			);
+			await new Promise((resolve) => setTimeout(resolve, delay));
+		}
+	}
+}
+
 async function fetchBatched<T, R>(
 	label: string,
 	items: readonly T[],
@@ -77,7 +106,7 @@ async function fetchBatched<T, R>(
 		batches,
 		Math.min(WORKERS, batches.length),
 		async (batch) => {
-			const batchResults = await fn(batch);
+			const batchResults = await withRetries(`${label} batch`, () => fn(batch));
 
 			completed += batch.length;
 			progress(completed);
@@ -107,29 +136,12 @@ function getSprite(pokemon?: Pokedex.Pokemon): string | undefined {
 	return toLocalSpriteUrl(pokemon?.sprites.front_default);
 }
 
-function hasAnySuffix(name: string, suffixes: string[]): boolean {
-	return suffixes.some((suffix) => name.endsWith(suffix));
+function getFemaleSprite(pokemon?: Pokedex.Pokemon): string | undefined {
+	return toLocalSpriteUrl(pokemon?.sprites.front_female);
 }
 
-function getBaseName(name: string): string {
-	return name.split('-')[0];
-}
-
-function isAlwaysIncludedForm(name: string): boolean {
-	return hasAnySuffix(name, FORM_RULES.alwaysIncludedSuffixes);
-}
-
-function isCosmeticForm(name: string): boolean {
-	if (isAlwaysIncludedForm(name)) return false;
-
-	return (
-		FORM_RULES.cosmeticSpecies.has(getBaseName(name)) ||
-		FORM_RULES.cosmeticSuffixes.some((suffix) => name.includes(suffix))
-	);
-}
-
-function shouldIncludeVariety(variety: Pokedex.Variety): boolean {
-	return variety.is_default || !isCosmeticForm(variety.pokemon.name);
+function toGenderNeutralFormName(name: string): string {
+	return name.replace(/-(male|female)(?=-|$)/g, '');
 }
 
 function toDisplayPokemonName(name: string): string {
@@ -174,15 +186,13 @@ function formatGamePair(names: string[]): string {
 }
 
 async function getAllSpecies(): Promise<Pokedex.NamedAPIResource[]> {
-	const firstPage = (await pokemonApi.getPokemonSpeciesList({
-		offset: 0,
-		limit: 1
-	})) as Pokedex.NamedAPIResourceList;
+	const firstPage = (await withRetries('Fetching species count', () =>
+		pokemonApi.getPokemonSpeciesList({ offset: 0, limit: 1 })
+	)) as Pokedex.NamedAPIResourceList;
 
-	const allSpecies = (await pokemonApi.getPokemonSpeciesList({
-		offset: 0,
-		limit: firstPage.count
-	})) as Pokedex.NamedAPIResourceList;
+	const allSpecies = (await withRetries('Fetching species list', () =>
+		pokemonApi.getPokemonSpeciesList({ offset: 0, limit: firstPage.count })
+	)) as Pokedex.NamedAPIResourceList;
 
 	return allSpecies.results;
 }
@@ -287,31 +297,79 @@ async function getGenerationByPokemonId(
 	return generationByPokemonId;
 }
 
-function getAltSpritesByDefaultId(
-	species: Pokedex.PokemonSpecies[],
-	pokemonById: Map<string, Pokedex.Pokemon>
-): Map<string, string[]> {
-	const altSpritesByDefaultId = new Map<string, string[]>();
+function hasSameTyping(first: Pokemon, second: Pokemon): boolean {
+	return first.type1.id === second.type1.id && first.type2?.id === second.type2?.id;
+}
 
-	for (const entry of species) {
-		const defaultVariety = entry.varieties.find((variety) => variety.is_default);
-		if (!defaultVariety) continue;
+function hasDistinctGuessProperties(defaultPokemon: Pokemon, pokemon: Pokemon): boolean {
+	return (
+		defaultPokemon.gen.id !== pokemon.gen.id ||
+		defaultPokemon.height !== pokemon.height ||
+		defaultPokemon.weight !== pokemon.weight ||
+		!hasSameTyping(defaultPokemon, pokemon)
+	);
+}
 
-		const defaultId = getIdFromUrl(defaultVariety.pokemon.url);
-		const defaultSprite = getSprite(pokemonById.get(defaultId));
-		if (!defaultSprite) continue;
+function isMegaForm(name: string): boolean {
+	return name.includes('-mega');
+}
 
-		const altSprites = entry.varieties
-			.filter((variety) => !variety.is_default && isCosmeticForm(variety.pokemon.name))
-			.map((variety) => getSprite(pokemonById.get(getIdFromUrl(variety.pokemon.url))))
-			.filter((sprite): sprite is string => Boolean(sprite));
+function isAlwaysIncludedForm(name: string): boolean {
+	return isMegaForm(name) || name.endsWith('-gmax');
+}
 
-		if (altSprites.length > 0) {
-			altSpritesByDefaultId.set(defaultId, [defaultSprite, ...altSprites]);
-		}
+function isCosmeticForm(speciesName: string, formName: string): boolean {
+	return (
+		COSMETIC_SPECIES.has(speciesName) ||
+		COSMETIC_SUFFIXES.some((suffix) => formName.includes(suffix))
+	);
+}
+
+type BuiltVariety = {
+	name: string;
+	pokemon: Pokemon;
+	isDefault: boolean;
+};
+
+function getRegionalParent(
+	variety: BuiltVariety,
+	varieties: BuiltVariety[],
+	speciesName: string
+): BuiltVariety | undefined {
+	const regions = Object.keys(REGIONAL_PREFIXES) as Region[];
+	const region = regions.find((region) => variety.name.split('-').includes(region));
+	const regionalParents = regions
+		.map((region) => varieties.find((candidate) => candidate.name === `${speciesName}-${region}`))
+		.filter((candidate): candidate is BuiltVariety => Boolean(candidate));
+
+	if (region) {
+		const parentName = `${speciesName}-${region}`;
+		return variety.name === parentName
+			? undefined
+			: regionalParents.find((candidate) => candidate.name === parentName);
 	}
 
-	return altSpritesByDefaultId;
+	if (!variety.name.includes('-totem')) return undefined;
+
+	return regionalParents.find(
+		(candidate) =>
+			candidate.pokemon.gen.id === variety.pokemon.gen.id &&
+			hasSameTyping(candidate.pokemon, variety.pokemon)
+	);
+}
+
+function getEquivalentMegaParent(
+	variety: BuiltVariety,
+	varieties: BuiltVariety[]
+): BuiltVariety | undefined {
+	if (!isMegaForm(variety.name)) return undefined;
+
+	const parent = varieties.find(
+		(candidate) =>
+			isMegaForm(candidate.name) && !hasDistinctGuessProperties(candidate.pokemon, variety.pokemon)
+	);
+
+	return parent === variety ? undefined : parent;
 }
 
 function toReadableAllCapsWord(value: string): string {
@@ -347,7 +405,6 @@ function toPokemon(
 	species: Pokedex.PokemonSpecies,
 	variety: Pokedex.Variety,
 	pokemonById: Map<string, Pokedex.Pokemon>,
-	altSpritesByDefaultId: Map<string, string[]>,
 	generationByPokemonId: Map<string, { id: number; name: string }>
 ): Pokemon | undefined {
 	const id = getIdFromUrl(variety.pokemon.url);
@@ -357,15 +414,22 @@ function toPokemon(
 
 	if (!pokemon || !sprite || !gen) return undefined;
 
-	const name = toDisplayPokemonName(variety.pokemon.name);
+	const neutralFormName = toGenderNeutralFormName(variety.pokemon.name);
+	const name = toDisplayPokemonName(neutralFormName);
 	const types = [...pokemon.types].sort((a, b) => a.slot - b.slot).map(toPokemonType);
+	const hasExplicitFemaleVariety = species.varieties.some(
+		(entry) =>
+			entry.pokemon.name.includes('-female') &&
+			toGenderNeutralFormName(entry.pokemon.name) === neutralFormName
+	);
+	const femaleSprite = hasExplicitFemaleVariety ? undefined : getFemaleSprite(pokemon);
 
 	return {
 		id,
 		name,
 		searchName: name.toLowerCase(),
 		sprite,
-		altSprites: altSpritesByDefaultId.get(id),
+		altSprites: femaleSprite && femaleSprite !== sprite ? [sprite, femaleSprite] : undefined,
 		flavorText: getFlavorText(species),
 		gen,
 		height: pokemon.height / 10,
@@ -388,23 +452,74 @@ async function main(): Promise<void> {
 
 	const allVarieties = species.flatMap((entry) => entry.varieties);
 
-	const includedVarieties = species.flatMap((entry) =>
-		entry.varieties.filter(shouldIncludeVariety).map((variety) => ({ species: entry, variety }))
-	);
-
 	const pokemonById = await getPokemonById(allVarieties);
 	const generationByPokemonId = await getGenerationByPokemonId(pokemonById);
-	const altSpritesByDefaultId = getAltSpritesByDefaultId(species, pokemonById);
+	const buildProgress = createProgressBar('Building Pokémon', allVarieties.length);
+	let completed = 0;
 
-	const buildProgress = createProgressBar('Building Pokémon', includedVarieties.length);
+	const pokemon = species.flatMap((entry) => {
+		const varieties = entry.varieties
+			.map((variety) => {
+				buildProgress(++completed);
 
-	const pokemon = includedVarieties
-		.map(({ species, variety }, index) => {
-			buildProgress(index + 1);
+				const pokemon = toPokemon(entry, variety, pokemonById, generationByPokemonId);
+				return (
+					pokemon && {
+						name: variety.pokemon.name,
+						pokemon,
+						isDefault: variety.is_default
+					}
+				);
+			})
+			.filter((entry): entry is BuiltVariety => Boolean(entry));
+		const defaultPokemon = varieties.find((entry) => entry.isDefault)?.pokemon;
 
-			return toPokemon(species, variety, pokemonById, altSpritesByDefaultId, generationByPokemonId);
-		})
-		.filter((entry): entry is Pokemon => Boolean(entry));
+		if (!defaultPokemon) return [];
+
+		const included = new Set([defaultPokemon.id]);
+		const altSpritesByPokemonId = new Map<string, string[]>();
+
+		for (const variety of varieties.filter((entry) => !entry.isDefault)) {
+			const equivalentMegaParent = getEquivalentMegaParent(variety, varieties);
+
+			if (equivalentMegaParent) {
+				const altSprites = altSpritesByPokemonId.get(equivalentMegaParent.pokemon.id) ?? [];
+				altSprites.push(variety.pokemon.sprite);
+				altSpritesByPokemonId.set(equivalentMegaParent.pokemon.id, altSprites);
+				continue;
+			}
+
+			const regionalParent = getRegionalParent(variety, varieties, entry.name);
+
+			if (
+				isAlwaysIncludedForm(variety.name) ||
+				(!regionalParent &&
+					!isCosmeticForm(entry.name, variety.name) &&
+					hasDistinctGuessProperties(defaultPokemon, variety.pokemon))
+			) {
+				included.add(variety.pokemon.id);
+				continue;
+			}
+
+			const parent = regionalParent?.pokemon ?? defaultPokemon;
+			const altSprites = altSpritesByPokemonId.get(parent.id) ?? [];
+			altSprites.push(variety.pokemon.sprite);
+			altSpritesByPokemonId.set(parent.id, altSprites);
+		}
+
+		return varieties
+			.filter((variety) => included.has(variety.pokemon.id))
+			.map(({ pokemon }) => {
+				const altSprites = [
+					...(pokemon.altSprites?.slice(1) ?? []),
+					...(altSpritesByPokemonId.get(pokemon.id) ?? [])
+				].filter((sprite, index, sprites) => sprites.indexOf(sprite) === index);
+
+				return altSprites.length > 0
+					? { ...pokemon, altSprites: [pokemon.sprite, ...altSprites] }
+					: pokemon;
+			});
+	});
 
 	await mkdir('.generated', { recursive: true });
 	await writeFile('.generated/pokemon.json', JSON.stringify(pokemon, null, 2));
